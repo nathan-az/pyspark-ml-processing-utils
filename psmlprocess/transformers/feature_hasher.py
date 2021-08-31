@@ -5,6 +5,7 @@ from pyspark.ml.param import Param
 from pyspark.sql import functions as f, DataFrame
 from pyspark.ml.base import Transformer
 from pyspark.ml.util import DefaultParamsWritable, DefaultParamsReadable
+from pyspark.sql.types import StringType
 
 
 def replace_suffix(s: str, add_suffix: str, remove_suffix: Optional[str]):
@@ -22,9 +23,7 @@ def get_features_to_hash(df: DataFrame, cat_features: List[str], max_dim: int):
         .agg(*[f.approx_count_distinct(c).alias(c) for c in cat_features])
         .collect()
     )
-    for_hashing = {
-        k for k, v in approx_counts[0].asDict().items() if v > max_dim
-    }
+    for_hashing = {k for k, v in approx_counts[0].asDict().items() if v > max_dim}
     return for_hashing
 
 
@@ -36,7 +35,8 @@ def hash_columns(
     to_hash: List[str],
     after_hash: List[str],
     max_dim: int,
-    handle_nulls: VALID_NULL_TREATMENTS,
+    salt: Optional[str] = "",
+    handle_nulls: VALID_NULL_TREATMENTS = "hash",
 ):
     if not len(to_hash) == len(after_hash):
         raise ValueError(
@@ -44,14 +44,16 @@ def hash_columns(
         )
 
     if handle_nulls == "hash":
-        hash_fn = lambda x: f.abs(f.hash(x) % max_dim)
+        hash_fn = lambda x: f.abs(
+            f.hash(f.concat(f.col(x).cast(StringType()), f.lit(salt))) % max_dim
+        )
     elif handle_nulls == "keep":
         hash_fn = lambda x: f.when(f.col(x).isNull(), None).otherwise(
-            f.abs(f.hash(x) % max_dim)
+            f.abs(f.hash(f.concat(f.col(x).cast(StringType()), f.lit(salt))) % max_dim)
         )
     elif handle_nulls == "-1":
         hash_fn = lambda x: f.when(f.col(x).isNull(), -1).otherwise(
-            f.abs(f.hash(x) % max_dim)
+            f.abs(f.hash(f.concat(f.col(x).cast(StringType()), f.lit(salt))) % max_dim)
         )
     else:
         raise ValueError(
@@ -60,34 +62,33 @@ def hash_columns(
 
     for before, after in zip(to_hash, after_hash):
         df = df.withColumn(after, hash_fn(before))
+
     return df
 
 
-class MultiFeatureHasher(
-    Transformer, DefaultParamsReadable, DefaultParamsWritable
-):
+class MultiFeatureHasher(Transformer, DefaultParamsReadable, DefaultParamsWritable):
     @keyword_only
     def __init__(
-        self, inputCols=None, outputCols=None, maxDim=32, handleNull="hash"
+        self, inputCols=None, outputCols=None, maxDim=32, handleNull="hash", numHashes=1
     ):
         super().__init__()
         self.inputCols = Param(self, "inputCols", "inputCols")
         self.outputCols = Param(self, "outputCols", "inputCols")
         self.maxDim = Param(self, "maxDim", "maxDim")
         self.handleNull = Param(self, "handleNull", "handleNull")
+        self.numHashes = Param(self, "numHashes", "numHashes")
 
         self._setDefault(inputCols=inputCols)
         self._setDefault(outputCols=outputCols)
         self._setDefault(maxDim=maxDim)
         self._setDefault(handleNull=handleNull)
+        self._setDefault(numHashes=numHashes)
 
         kwargs = self._input_kwargs
         self.setParams(**kwargs)
 
     @keyword_only
-    def setParams(
-        self, inputCols=None, outputCols=None, maxDim=32, handleNull="hash"
-    ):
+    def setParams(self, inputCols=None, outputCols=None, maxDim=32, handleNull="hash"):
         kwargs = self._input_kwargs
         return self._set(**kwargs)
 
@@ -103,6 +104,9 @@ class MultiFeatureHasher(
     def getHandleNull(self):
         return self.getOrDefault(self.handleNull)
 
+    def getNumHashes(self):
+        return self.getOrDefault(self.numHashes)
+
     def setInputCols(self, value):
         return self._set(inputCols=value)
 
@@ -115,11 +119,31 @@ class MultiFeatureHasher(
     def setHandleNull(self, value):
         return self._set(handleNull=value)
 
+    def setNumHashes(self, value):
+        return self._set(numHashes=value)
+
     def _transform(self, df):
-        return hash_columns(
-            df,
-            to_hash=self.getInputCols(),
-            after_hash=self.getOutputCols(),
-            max_dim=self.getMaxDim(),
-            handle_nulls=self.getHandleNull(),
-        )
+        num_hashes = self.getNumHashes()
+        output_cols = self.getOutputCols()
+
+        if num_hashes == 1:
+            return hash_columns(
+                df,
+                to_hash=self.getInputCols(),
+                after_hash=self.getOutputCols(),
+                max_dim=self.getMaxDim(),
+                handle_nulls=self.getHandleNull(),
+            )
+        else:
+            for i in range(num_hashes):
+                salt = str(i)
+                salted_output_cols = [f"{x}_{salt}" for x in output_cols]
+                df = hash_columns(
+                    df,
+                    to_hash=self.getInputCols(),
+                    after_hash=salted_output_cols,
+                    max_dim=self.getMaxDim(),
+                    salt=salt,
+                    handle_nulls=self.getHandleNull(),
+                )
+            return df
